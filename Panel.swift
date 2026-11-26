@@ -187,6 +187,35 @@ struct VisualEffectBackdrop: NSViewRepresentable {
     }
 }
 
+private extension View {
+    @ViewBuilder
+    func panelGlass<S: Shape>(in shape: S) -> some View {
+        if #available(macOS 26, *) {
+            glassEffect(.regular, in: shape)
+        } else {
+            background(.regularMaterial, in: shape)
+        }
+    }
+
+    @ViewBuilder
+    func glassButton(prominent: Bool = false) -> some View {
+        if #available(macOS 26, *) {
+            if prominent { buttonStyle(.glassProminent) } else { buttonStyle(.glass) }
+        } else {
+            if prominent { buttonStyle(.borderedProminent) } else { buttonStyle(.bordered) }
+        }
+    }
+
+    @ViewBuilder
+    func groupedGlass() -> some View {
+        if #available(macOS 26, *) {
+            GlassEffectContainer(spacing: 2) { self }
+        } else {
+            self
+        }
+    }
+}
+
 struct Panel: View {
     @ObservedObject var model: PanelModel
     @FocusState private var searchFocus: Bool
@@ -195,13 +224,17 @@ struct Panel: View {
     @AppStorage("spacing") private var spacing = 32
 
     static let panelSize = CGSize(width: 392, height: 520)
-    private let cornerRadius: CGFloat = 16
+    private let cornerRadius: CGFloat = 22
     private let railInset: CGFloat = 14
     private let shortcuts = "Enter 切入 · ⌘↩ 切入并专注 · ↑↓ 选择 · Esc 关闭"
 
     var body: some View {
         ZStack {
-            VisualEffectBackdrop(material: .popover, blendingMode: .behindWindow)
+            if #available(macOS 26, *) {
+                Color.clear.glassEffect(.regular, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            } else {
+                VisualEffectBackdrop(material: .popover, blendingMode: .behindWindow)
+            }
 
             if model.settings {
                 settingsPage
@@ -215,7 +248,10 @@ struct Panel: View {
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                .strokeBorder(Color.primary.opacity(0.14), lineWidth: 1)
+                .strokeBorder(LinearGradient(colors: [.white.opacity(0.46), .white.opacity(0.08),
+                                                      .primary.opacity(0.12)], startPoint: .topLeading,
+                                             endPoint: .bottomTrailing), lineWidth: 0.75)
+                .allowsHitTesting(false)
         )
         .onAppear { searchFocus = true }
         .onChange(of: model.focusRequest) { searchFocus = true }
@@ -238,36 +274,34 @@ struct Panel: View {
 
     private var topFrostedBar: some View {
         VStack(alignment: .leading, spacing: 10) {
-            // Search box
             HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.secondary)
-                TextField("搜索应用或窗口标题", text: $model.query)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13.5))
-                    .focused($searchFocus)
-                    .onChange(of: model.query) { model.selectValid() }
-                if !model.query.isEmpty {
-                    Button {
-                        model.query = ""
-                        model.selectValid()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    TextField("搜索应用或窗口标题", text: $model.query)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13.5))
+                        .focused($searchFocus)
+                        .onChange(of: model.query) { model.selectValid() }
+                    if !model.query.isEmpty {
+                        Button {
+                            model.query = ""
+                            model.selectValid()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("清空搜索")
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("清空搜索")
                 }
+                .padding(.horizontal, 11)
+                .frame(height: 30)
+                .panelGlass(in: Capsule())
                 icon("gearshape", "设置") { model.settings = true }
             }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(
-                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                    .fill(Color.primary.opacity(0.06))
-            )
 
             // Count + Sort mode
             HStack(spacing: 8) {
@@ -287,30 +321,28 @@ struct Panel: View {
                         Text(model.grouped ? "按应用分组" : "最近使用")
                             .font(.system(size: 12, weight: .medium))
                     }
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(Capsule().fill(Color.primary.opacity(0.06)))
                 }
-                .buttonStyle(.plain)
+                .glassButton()
+                .controlSize(.small)
             }
 
             // Quick Actions
             HStack(spacing: 8) {
                 Button("一键专注") { model.organize("focus") }
-                    .buttonStyle(.bordered)
+                    .glassButton()
                     .controlSize(.small)
                 Button("错落排齐") { model.organize("cascade") }
-                    .buttonStyle(.bordered)
+                    .glassButton()
                     .controlSize(.small)
                 Spacer()
                 Button("撤销") { model.organize("undo") }
-                    .buttonStyle(.bordered)
+                    .glassButton()
                     .controlSize(.small)
                     .disabled(!model.canUndo)
             }
             .disabled(model.loading)
         }
+        .groupedGlass()
         .padding(.horizontal, railInset)
         .padding(.top, 14)
         .padding(.bottom, 12)
@@ -343,67 +375,36 @@ struct Panel: View {
     }
 
     private var bottomFrostedBar: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if !model.message.isEmpty {
-                HStack(spacing: 6) {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Color.accentColor)
-                    Text(model.message)
-                        .font(.system(size: 12))
-                        .lineLimit(1)
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(.regularMaterial)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                .strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.5)
-                        )
-                )
-                .padding(.horizontal, railInset)
-                .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-
-            HStack {
-                Text(shortcuts)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Spacer(minLength: 0)
-            }
+        Text(shortcuts)
+            .font(.system(size: 11))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
             .padding(.horizontal, railInset)
-            .padding(.top, 10)
-            .padding(.bottom, 11)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                // Seamless upward Gaussian blur connecting scrolling rows with the bottom bar
-                ZStack(alignment: .top) {
-                    Rectangle()
-                        .fill(.regularMaterial)
-                        .mask(
-                            LinearGradient(
-                                stops: [
-                                    .init(color: .clear, location: 0.0),
-                                    .init(color: .black.opacity(0.72), location: 0.32),
-                                    .init(color: .black, location: 0.48),
-                                    .init(color: .black, location: 1.0)
-                                ],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        )
-                        .padding(.top, -22)
-                    Rectangle()
-                        .fill(Color.primary.opacity(0.07))
-                        .frame(height: 0.5)
+            .padding(.vertical, 11)
+            .background {
+                Color.clear
+                    .panelGlass(in: Rectangle())
+                    .padding(.top, -16)
+                    .mask(LinearGradient(stops: [.init(color: .clear, location: 0),
+                                                 .init(color: .black, location: 0.34)],
+                                         startPoint: .top, endPoint: .bottom)
+                        .padding(.top, -16))
+                    .allowsHitTesting(false)
+            }
+            .overlay(alignment: .top) {
+                if !model.message.isEmpty {
+                    Text(model.message)
+                        .font(.system(size: 12, weight: .medium))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .panelGlass(in: Capsule())
+                        .alignmentGuide(.top) { $0[.bottom] + 6 }
+                        .allowsHitTesting(false)
+                        .transition(.opacity.combined(with: .offset(y: 4)))
                 }
-                .allowsHitTesting(false)
-            )
-        }
+            }
+            .animation(.easeOut(duration: 0.2), value: model.message)
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
             if abs(model.footerHeight - height) > 0.5 { model.footerHeight = height }
         }
@@ -468,7 +469,8 @@ struct Panel: View {
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 1)
-                .background(Capsule().fill(Color.primary.opacity(0.06)))
+                .background(.thinMaterial, in: Capsule())
+                .overlay(Capsule().strokeBorder(.primary.opacity(0.1), lineWidth: 0.5))
             Spacer(minLength: 0)
             icon(section.isAppHidden ? "eye.slash" : "eye", section.isAppHidden ? "显示应用" : "隐藏应用") {
                 let ok = section.app.isHidden ? section.app.unhide() : section.app.hide()
@@ -521,34 +523,39 @@ struct Panel: View {
             .buttonStyle(.plain)
             .help(w.title)
 
-            if showActions {
-                HStack(spacing: 2) {
-                    icon("scope", "切入并专注") { model.focus(w, collapse: true) }
-                    icon(w.isMinimized || w.isAppHidden ? "arrow.up.right.square" : "minus.square",
-                         w.isMinimized || w.isAppHidden ? "恢复窗口" : "收起窗口") { model.toggle(w) }
-                    icon("xmark", "关闭窗口") {
-                        if !w.close() { model.setMessage("无法关闭该窗口") }
-                        model.refresh()
+            ZStack(alignment: .trailing) {
+                if showActions {
+                    HStack(spacing: 2) {
+                        icon("scope", "切入并专注") { model.focus(w, collapse: true) }
+                        icon(w.isMinimized || w.isAppHidden ? "arrow.up.right.square" : "minus.square",
+                             w.isMinimized || w.isAppHidden ? "恢复窗口" : "收起窗口") { model.toggle(w) }
+                        icon("xmark", "关闭窗口") {
+                            if !w.close() { model.setMessage("无法关闭该窗口") }
+                            model.refresh()
+                        }
                     }
+                } else if w.isAppHidden || w.isMinimized || isCurrent {
+                    Text(w.isAppHidden ? "已隐藏" : w.isMinimized ? "已最小化" : "当前")
+                        .font(.system(size: 11))
+                        .foregroundStyle(isCurrent ? Color.accentColor : .secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            Capsule().fill(isCurrent ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.05))
+                        )
                 }
-            } else if w.isAppHidden || w.isMinimized || isCurrent {
-                Text(w.isAppHidden ? "已隐藏" : w.isMinimized ? "已最小化" : "当前")
-                    .font(.system(size: 11))
-                    .foregroundStyle(isCurrent ? Color.accentColor : .secondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(
-                        Capsule().fill(isCurrent ? Color.accentColor.opacity(0.12) : Color.primary.opacity(0.05))
-                    )
             }
+            .frame(width: 70, height: 22, alignment: .trailing)
         }
         // Exact 14pt visual rail (6pt outer + 8pt inner) matching top bar, group headers & bottom bar
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
+            Capsule()
                 .fill(isSelected ? Color.accentColor.opacity(0.16) : (isHovered ? Color.primary.opacity(0.06) : Color.clear))
         )
+        .overlay(Capsule().strokeBorder(.white.opacity(isSelected ? 0.30 : isHovered ? 0.15 : 0), lineWidth: 0.65)
+            .allowsHitTesting(false))
         .onHover { over in
             if over { model.hovered = w.id }
             else if model.hovered == w.id { model.hovered = nil }
@@ -588,9 +595,13 @@ struct Panel: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
-                    Divider().opacity(0.5)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .panelGlass(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+
 
                     VStack(alignment: .leading, spacing: 10) {
+                        Text("列表与排版").font(.system(size: 13, weight: .semibold))
                         Picker("列表默认视图", selection: $defaultGrouped) {
                             Text("按应用分组").tag(true)
                             Text("最近使用").tag(false)
@@ -603,6 +614,9 @@ struct Panel: View {
                             Text("宽松（44 pt）").tag(44)
                         }
                     }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .panelGlass(in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 }
                 .padding(railInset)
             }
@@ -630,7 +644,7 @@ struct Panel: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Button("打开辅助功能设置") { model.openPrivacy() }
-                    .buttonStyle(.borderedProminent)
+                    .glassButton(prominent: true)
                     .task {
                         while !Task.isCancelled {
                             if AXIsProcessTrusted() {
@@ -670,10 +684,12 @@ struct Panel: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 12.5))
-                .frame(width: 22, height: 22)
-                .contentShape(Rectangle())
+                .imageScale(.medium)
         }
-        .buttonStyle(.borderless)
+        .glassButton()
+        .buttonBorderShape(.circle)
+        .controlSize(.mini)
+        .frame(width: 22, height: 22)
         .accessibilityLabel(name)
         .help(name)
     }
