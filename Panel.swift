@@ -23,6 +23,9 @@ final class PanelModel: ObservableObject {
     @Published var loading = false
     @Published var message = ""
     @Published var canUndo = false
+    @Published var confirmCloseAll = false
+    @Published var batchMode = false
+    @Published var batch = BatchSelection<WindowKey>()
     @Published var focusRequest = 0
     @Published var headerHeight: CGFloat = 126
     @Published var footerHeight: CGFloat = 38
@@ -30,6 +33,7 @@ final class PanelModel: ObservableObject {
     let organizer = Organizer()
     private var generation = 0
     private var messageWorkItem: DispatchWorkItem?
+    private var confirmWorkItem: DispatchWorkItem?
     private let scanner = DispatchQueue(label: "local.chuangge.window-scan", qos: .userInitiated)
 
     var sections: [AppSection] {
@@ -85,6 +89,8 @@ final class PanelModel: ObservableObject {
             windows = []
             selected = nil
             hovered = nil
+            cancelCloseAll()
+            exitBatchMode()
             setMessage("", autoClear: false)
         }
         loading = true
@@ -93,6 +99,7 @@ final class PanelModel: ObservableObject {
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.generation == token else { return }
                 self.windows = rows
+                self.batch.prune(valid: Set(rows.map(\.id)))
                 if capture {
                     self.front = (rows.first { $0.visible && $0.id.pid == pid } ?? rows.first { $0.visible })?.id
                 }
@@ -131,6 +138,7 @@ final class PanelModel: ObservableObject {
     }
 
     func organize(_ action: String) {
+        cancelCloseAll()
         let rows = ManagedWindow.scan(order: ManagedWindow.stacking())
         switch action {
         case "focus":
@@ -145,9 +153,117 @@ final class PanelModel: ObservableObject {
                                           hideApps: UserDefaults.standard.bool(forKey: "hideApps")))
         case "cascade":
             setMessage(organizer.cascade(rows, spacing: UserDefaults.standard.integer(forKey: "spacing")))
+        case "closeAll":
+            let quitEmpty = UserDefaults.standard.bool(forKey: "quitOnCloseAllWindows")
+            setMessage(organizer.closeAll(rows, quitEmptyApps: quitEmpty))
+            canUndo = organizer.canUndo
+            refresh()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                self?.refresh()
+            }
+            return
         default:
             setMessage(organizer.undo())
         }
+        canUndo = organizer.canUndo
+        refresh()
+    }
+
+    func requestCloseAll() {
+        let needsConfirm = UserDefaults.standard.bool(forKey: "confirmCloseAll")
+        if !needsConfirm || confirmCloseAll {
+            organize("closeAll")
+            return
+        }
+        confirmWorkItem?.cancel()
+        withAnimation(.easeOut(duration: 0.16)) {
+            confirmCloseAll = true
+        }
+        let work = DispatchWorkItem { [weak self] in
+            withAnimation(.easeOut(duration: 0.16)) {
+                self?.confirmCloseAll = false
+            }
+        }
+        confirmWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: work)
+    }
+
+    func cancelCloseAll() {
+        confirmWorkItem?.cancel()
+        confirmWorkItem = nil
+        if confirmCloseAll { confirmCloseAll = false }
+    }
+
+    func enterBatchMode(selecting id: WindowKey? = nil) {
+        cancelCloseAll()
+        batchMode = true
+        if let id { batch.toggle(id) }
+    }
+
+    func exitBatchMode() {
+        batchMode = false
+        batch.clear()
+    }
+
+    func toggleBatch(_ id: WindowKey) {
+        batch.toggle(id)
+    }
+
+    func toggleBatchGroup(_ list: [ManagedWindow]) {
+        batch.toggleGroup(list.map(\.id))
+    }
+
+    func toggleBatchAllVisible() {
+        batch.toggleAll(visible: filtered.map(\.id))
+    }
+
+    func invertBatchVisible() {
+        batch.invert(visible: filtered.map(\.id))
+    }
+
+    func closeAppWindows(_ list: [ManagedWindow]) {
+        cancelCloseAll()
+        let quitEmpty = UserDefaults.standard.bool(forKey: "quitOnCloseAllWindows")
+        setMessage(organizer.closeWindows(list, allWindows: windows, quitEmptyApps: quitEmpty))
+        refresh()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.refresh()
+        }
+    }
+
+    func quitApp(_ app: NSRunningApplication, name: String) {
+        cancelCloseAll()
+        setMessage(organizer.quitApp(app, name: name))
+        refresh()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) { [weak self] in
+            self?.refresh()
+        }
+    }
+
+    func batchClose(keepSelected: Bool) {
+        guard !batch.isEmpty else { return }
+        let rows = ManagedWindow.scan(order: ManagedWindow.stacking())
+        let byID = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
+        let targetIDs = batch.targetsToClose(all: rows.map(\.id), keepSelected: keepSelected)
+        let targets = targetIDs.compactMap { byID[$0] }
+        let keptCount = keepSelected ? rows.filter { batch.contains($0.id) }.count : 0
+        let quitEmpty = UserDefaults.standard.bool(forKey: "quitOnCloseAllWindows")
+        setMessage(organizer.closeWindows(targets, allWindows: rows, quitEmptyApps: quitEmpty, keptCount: keptCount))
+        exitBatchMode()
+        canUndo = organizer.canUndo
+        refresh()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.refresh()
+        }
+    }
+
+    func batchCollapseOthers() {
+        guard !batch.isEmpty else { return }
+        let rows = ManagedWindow.scan(order: ManagedWindow.stacking())
+        let kept = batch.items
+        setMessage(organizer.collapse(keepingIds: kept, windows: rows,
+                                      hideApps: UserDefaults.standard.bool(forKey: "hideApps")))
+        exitBatchMode()
         canUndo = organizer.canUndo
         refresh()
     }
@@ -222,11 +338,14 @@ struct Panel: View {
     @AppStorage("hideApps") private var hideApps = false
     @AppStorage("grouped") private var defaultGrouped = true
     @AppStorage("spacing") private var spacing = 32
+    @AppStorage("confirmCloseAll") private var confirmCloseAll = true
+    @AppStorage("quitOnCloseAllWindows") private var quitOnCloseAllWindows = false
 
     static let panelSize = CGSize(width: 392, height: 520)
     private let cornerRadius: CGFloat = 22
     private let railInset: CGFloat = 14
     private let shortcuts = "Enter 切入 · ⌘↩ 切入并专注 · ↑↓ 选择 · Esc 关闭"
+    private let batchShortcuts = "点击或 Enter 勾选 · 点应用名整组勾选 · Esc 退出批量"
 
     var body: some View {
         ZStack {
@@ -300,47 +419,139 @@ struct Panel: View {
                 .padding(.horizontal, 11)
                 .frame(height: 30)
                 .panelGlass(in: Capsule())
-                icon("gearshape", "设置") { model.settings = true }
+                icon("gearshape", "设置") {
+                    model.exitBatchMode()
+                    model.settings = true
+                }
             }
 
-            // Count + Sort mode
-            HStack(spacing: 8) {
+            // Count + Sort / Batch controls
+            HStack(spacing: 6) {
                 let total = model.windows.count
                 let shown = model.filtered.count
-                Text(model.query.isEmpty ? "\(total) 个窗口" : "\(shown) / \(total) 个窗口")
-                    .font(.system(size: 12.5, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    model.grouped.toggle()
-                    model.selectValid()
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: model.grouped ? "square.stack.3d.up" : "clock")
-                            .font(.system(size: 11))
-                        Text(model.grouped ? "按应用分组" : "最近使用")
-                            .font(.system(size: 12, weight: .medium))
+                if model.batchMode {
+                    Text("已选 \(model.batch.count) / \(total)")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(Color.accentColor)
+                    Spacer()
+                    let allVisibleChecked = !model.filtered.isEmpty && model.batch.groupState(for: model.filtered.map(\.id)) == .all
+                    Button(allVisibleChecked ? "取消全选" : "全选") {
+                        model.toggleBatchAllVisible()
                     }
+                    .glassButton()
+                    .controlSize(.mini)
+                    .disabled(model.filtered.isEmpty)
+                    Button("反选") {
+                        model.invertBatchVisible()
+                    }
+                    .glassButton()
+                    .controlSize(.mini)
+                    .disabled(model.filtered.isEmpty)
+                    Button("完成") {
+                        model.exitBatchMode()
+                    }
+                    .glassButton()
+                    .controlSize(.mini)
+                } else {
+                    Text(model.query.isEmpty ? "\(total) 个窗口" : "\(shown) / \(total) 个窗口")
+                        .font(.system(size: 12.5, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        model.grouped.toggle()
+                        model.selectValid()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: model.grouped ? "square.stack.3d.up" : "clock")
+                                .font(.system(size: 11))
+                            Text(model.grouped ? "按应用分组" : "最近使用")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                    }
+                    .glassButton()
+                    .controlSize(.small)
+                    Button {
+                        model.enterBatchMode()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "checklist")
+                                .font(.system(size: 11))
+                            Text("批量")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                    }
+                    .glassButton()
+                    .controlSize(.small)
+                    .disabled(model.windows.isEmpty)
+                    .help("批量勾选窗口，快速关闭选中或只保留选中（也可按住 ⌘ 点击窗口进入）")
                 }
-                .glassButton()
-                .controlSize(.small)
             }
 
-            // Quick Actions
-            HStack(spacing: 8) {
-                Button("一键专注") { model.organize("focus") }
+            // Quick Actions / Batch Actions
+            if model.batchMode {
+                let keptCount = model.batch.count
+                let othersCount = max(0, model.windows.count - keptCount)
+                HStack(spacing: 6) {
+                    Button(role: .destructive) {
+                        model.batchClose(keepSelected: false)
+                    } label: {
+                        Text(keptCount > 0 ? "关闭选中(\(keptCount))" : "关闭选中")
+                            .foregroundStyle(keptCount > 0 ? Color.white : Color.secondary)
+                    }
+                    .glassButton(prominent: keptCount > 0)
+                    .tint(keptCount > 0 ? .red : nil)
+                    .controlSize(.small)
+                    .disabled(keptCount == 0)
+                    .help("关闭已勾选的 \(keptCount) 个窗口")
+
+                    Button {
+                        model.batchClose(keepSelected: true)
+                    } label: {
+                        Text(keptCount > 0 && othersCount > 0 ? "只保留选中(-\(othersCount))" : "只保留选中")
+                    }
+                    .glassButton(prominent: keptCount > 0 && othersCount > 0)
+                    .controlSize(.small)
+                    .disabled(keptCount == 0 || othersCount == 0)
+                    .help("保留已勾选的 \(keptCount) 个窗口，关闭其余 \(othersCount) 个窗口")
+
+                    Spacer(minLength: 0)
+
+                    Button("收起其余") {
+                        model.batchCollapseOthers()
+                    }
                     .glassButton()
                     .controlSize(.small)
-                Button("错落排齐") { model.organize("cascade") }
-                    .glassButton()
+                    .disabled(keptCount == 0 || othersCount == 0)
+                    .help("保留已勾选窗口，按专注策略收起其余窗口（可撤销）")
+                }
+                .disabled(model.loading)
+            } else {
+                HStack(spacing: 6) {
+                    Button("一键专注") { model.organize("focus") }
+                        .glassButton()
+                        .controlSize(.small)
+                    Button("错落排齐") { model.organize("cascade") }
+                        .glassButton()
+                        .controlSize(.small)
+                    Button(role: .destructive) {
+                        model.requestCloseAll()
+                    } label: {
+                        Text(model.confirmCloseAll ? "确认关闭(\(model.windows.count))" : "全部关闭")
+                            .foregroundStyle(model.confirmCloseAll ? Color.white : Color.red.opacity(0.88))
+                    }
+                    .glassButton(prominent: model.confirmCloseAll)
+                    .tint(model.confirmCloseAll ? .red : nil)
                     .controlSize(.small)
-                Spacer()
-                Button("撤销") { model.organize("undo") }
-                    .glassButton()
-                    .controlSize(.small)
-                    .disabled(!model.canUndo)
+                    .disabled(model.windows.isEmpty)
+                    .help(model.confirmCloseAll ? "再次点击关闭全部窗口（有未保存文件的应用会弹出保存提示）" : "一键关闭所有窗口")
+                    Spacer(minLength: 0)
+                    Button("撤销") { model.organize("undo") }
+                        .glassButton()
+                        .controlSize(.small)
+                        .disabled(!model.canUndo)
+                }
+                .disabled(model.loading)
             }
-            .disabled(model.loading)
         }
         .groupedGlass()
         .padding(.horizontal, railInset)
@@ -375,7 +586,7 @@ struct Panel: View {
     }
 
     private var bottomFrostedBar: some View {
-        Text(shortcuts)
+        Text(model.batchMode ? batchShortcuts : shortcuts)
             .font(.system(size: 11))
             .foregroundStyle(.secondary)
             .lineLimit(1)
@@ -459,23 +670,63 @@ struct Panel: View {
     }
 
     private func sectionHeader(_ section: AppSection) -> some View {
-        HStack(spacing: 8) {
-            appIcon(section.app)
-            Text(section.appName)
-                .font(.system(size: 12.5, weight: .semibold))
-                .lineLimit(1)
-            Text("\(section.windows.count)")
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 1)
-                .background(.thinMaterial, in: Capsule())
-                .overlay(Capsule().strokeBorder(.primary.opacity(0.1), lineWidth: 0.5))
-            Spacer(minLength: 0)
-            icon(section.isAppHidden ? "eye.slash" : "eye", section.isAppHidden ? "显示应用" : "隐藏应用") {
-                let ok = section.app.isHidden ? section.app.unhide() : section.app.hide()
-                if !ok { model.setMessage("无法更改应用可见性") }
-                model.refresh()
+        let groupState = model.batch.groupState(for: section.windows.map(\.id))
+        return HStack(spacing: 8) {
+            if model.batchMode {
+                Button {
+                    model.toggleBatchGroup(section.windows)
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: groupState == .all ? "checkmark.circle.fill"
+                              : groupState == .partial ? "minus.circle.fill" : "circle")
+                            .font(.system(size: 14))
+                            .foregroundStyle(groupState == .none ? Color.secondary : Color.accentColor)
+                            .frame(width: 18, alignment: .center)
+                        appIcon(section.app)
+                        Text(section.appName)
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .lineLimit(1)
+                        Text("\(section.windows.count)")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(.thinMaterial, in: Capsule())
+                            .overlay(Capsule().strokeBorder(.primary.opacity(0.1), lineWidth: 0.5))
+                        Spacer(minLength: 0)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("整组勾选或取消勾选 \(section.appName) 的全部窗口")
+            } else {
+                appIcon(section.app)
+                Text(section.appName)
+                    .font(.system(size: 12.5, weight: .semibold))
+                    .lineLimit(1)
+                Text("\(section.windows.count)")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 1)
+                    .background(.thinMaterial, in: Capsule())
+                    .overlay(Capsule().strokeBorder(.primary.opacity(0.1), lineWidth: 0.5))
+                Spacer(minLength: 0)
+                HStack(spacing: 4) {
+                    icon(section.isAppHidden ? "eye.slash" : "eye", section.isAppHidden ? "显示应用" : "隐藏应用") {
+                        let ok = section.app.isHidden ? section.app.unhide() : section.app.hide()
+                        if !ok { model.setMessage("无法更改应用可见性") }
+                        model.refresh()
+                    }
+                    icon("xmark", "关闭 \(section.appName) 全部窗口") {
+                        model.closeAppWindows(section.windows)
+                    }
+                    if section.app.bundleIdentifier != "com.apple.finder" {
+                        icon("power", "退出 \(section.appName)（⌘Q，可彻底关掉顶部栏常驻程序）") {
+                            model.quitApp(section.app, name: section.appName)
+                        }
+                    }
+                }
             }
         }
         // 6pt scroll padding + 8pt horizontal padding = exact 14pt rail alignment with top & bottom bars
@@ -487,15 +738,28 @@ struct Panel: View {
     private func row(_ w: ManagedWindow) -> some View {
         let isSelected = model.selected == w.id
         let isHovered = model.hovered == w.id
-        let showActions = isHovered || isSelected
+        let isChecked = model.batch.contains(w.id)
+        let showActions = !model.batchMode && (isHovered || isSelected)
         let isCurrent = model.front == w.id
 
         return HStack(spacing: 8) {
             Button {
-                model.focus(w, collapse: false)
+                if model.batchMode {
+                    model.toggleBatch(w.id)
+                } else if NSEvent.modifierFlags.contains(.command) {
+                    model.enterBatchMode(selecting: w.id)
+                } else {
+                    model.focus(w, collapse: false)
+                }
             } label: {
                 HStack(spacing: 8) {
-                    if !model.grouped {
+                    if model.batchMode {
+                        Image(systemName: isChecked ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 14))
+                            .foregroundStyle(isChecked ? Color.accentColor : Color.secondary)
+                            .frame(width: 18, alignment: .center)
+                        if !model.grouped { appIcon(w.app) }
+                    } else if !model.grouped {
                         appIcon(w.app)
                     } else {
                         Circle()
@@ -521,7 +785,7 @@ struct Panel: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help(w.title)
+            .help(model.batchMode ? "点击勾选或取消勾选" : w.title)
 
             ZStack(alignment: .trailing) {
                 if showActions {
@@ -552,10 +816,16 @@ struct Panel: View {
         .padding(.vertical, 6)
         .background(
             Capsule()
-                .fill(isSelected ? Color.accentColor.opacity(0.16) : (isHovered ? Color.primary.opacity(0.06) : Color.clear))
+                .fill(model.batchMode && isChecked
+                      ? Color.accentColor.opacity(0.18)
+                      : (isSelected ? Color.accentColor.opacity(0.16) : (isHovered ? Color.primary.opacity(0.06) : Color.clear)))
         )
-        .overlay(Capsule().strokeBorder(.white.opacity(isSelected ? 0.30 : isHovered ? 0.15 : 0), lineWidth: 0.65)
-            .allowsHitTesting(false))
+        .overlay(Capsule().strokeBorder(
+            model.batchMode && isChecked
+                ? Color.accentColor.opacity(0.45)
+                : Color.white.opacity(isSelected ? 0.30 : isHovered ? 0.15 : 0),
+            lineWidth: 0.75
+        ).allowsHitTesting(false))
         .onHover { over in
             if over { model.hovered = w.id }
             else if model.hovered == w.id { model.hovered = nil }
@@ -613,6 +883,16 @@ struct Panel: View {
                             Text("适中（32 pt）").tag(32)
                             Text("宽松（44 pt）").tag(44)
                         }
+
+                        Toggle("全部关闭前二次确认", isOn: $confirmCloseAll)
+                            .font(.system(size: 13))
+
+                        Toggle("关完应用全部窗口时退出该应用", isOn: $quitOnCloseAllWindows)
+                            .font(.system(size: 13))
+                        Text("开启后，批量或全部关闭某应用的所有窗口时会优雅退出该应用（自动跳过访达），解决微信、QQ、Clash 等缩到顶部菜单栏后关不掉的问题。")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     .padding(12)
                     .frame(maxWidth: .infinity, alignment: .leading)

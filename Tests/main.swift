@@ -54,13 +54,19 @@ let suite = "WindowTests." + UUID().uuidString
 let defaults = UserDefaults(suiteName: suite)!
 defer { defaults.removePersistentDomain(forName: suite) }
 Preferences.register(in: defaults)
-precondition(!defaults.bool(forKey: "hideApps") && defaults.bool(forKey: "grouped") && defaults.integer(forKey: "spacing") == 32)
+precondition(!defaults.bool(forKey: "hideApps") && defaults.bool(forKey: "grouped")
+             && defaults.integer(forKey: "spacing") == 32 && defaults.bool(forKey: "confirmCloseAll")
+             && !defaults.bool(forKey: "quitOnCloseAllWindows"))
 defaults.set(true, forKey: "hideApps")
 defaults.set(false, forKey: "grouped")
 defaults.set(44, forKey: "spacing")
+defaults.set(false, forKey: "confirmCloseAll")
+defaults.set(true, forKey: "quitOnCloseAllWindows")
 let reopened = UserDefaults(suiteName: suite)!
 Preferences.register(in: reopened)
-precondition(reopened.bool(forKey: "hideApps") && !reopened.bool(forKey: "grouped") && reopened.integer(forKey: "spacing") == 44)
+precondition(reopened.bool(forKey: "hideApps") && !reopened.bool(forKey: "grouped")
+             && reopened.integer(forKey: "spacing") == 44 && !reopened.bool(forKey: "confirmCloseAll")
+             && reopened.bool(forKey: "quitOnCloseAllWindows"))
 print("通过：设置默认值和持久化")
 
 var undo = UndoSnapshot(), completed = 0, attempts = 0
@@ -76,3 +82,28 @@ undo.record([{ true }])
 undo.restore()
 precondition(!undo.available)
 print("通过：快照替换、空操作、撤销及部分失败重试")
+
+var batch = BatchSelection<Int>()
+precondition(batch.isEmpty && batch.targetsToClose(all: [1, 2, 3], keepSelected: true).isEmpty)
+precondition(batch.targetsToClose(all: [1, 2, 3], keepSelected: false).isEmpty)
+batch.toggle(1)
+precondition(batch.contains(1) && batch.groupState(for: [1, 2]) == .partial)
+batch.toggleGroup([1, 2]) // partial -> all
+precondition(batch.groupState(for: [1, 2]) == .all && batch.count == 2)
+batch.toggleGroup([1, 2]) // all -> none
+precondition(batch.isEmpty)
+batch.toggle(1)
+batch.toggleAll(visible: [2, 3]) // keeps 1 outside filter while selecting visible 2,3
+precondition(batch.items == Set([1, 2, 3]))
+batch.invert(visible: [2, 4])
+precondition(batch.items == Set([1, 3, 4]))
+precondition(batch.targetsToClose(all: [1, 2, 3, 4, 5], keepSelected: false) == [1, 3, 4])
+precondition(batch.targetsToClose(all: [1, 2, 3, 4, 5], keepSelected: true) == [2, 5])
+batch.prune(valid: Set([1, 2, 5]))
+precondition(batch.items == Set([1]))
+let quitGroups = BatchSelection<Int>.fullyTargetedGroups(
+    all: [(1, "WeChat"), (2, "Chrome"), (3, "Chrome"), (4, "QQ"), (5, "QQ")],
+    targetIDs: Set([1, 2, 4, 5])
+)
+precondition(quitGroups == Set(["WeChat", "QQ"]), "仅全部窗口被关闭的应用才应进入退出集合")
+print("通过：批量勾选、整组勾选、过滤全选反选、保留或关闭及整应用退出判定")

@@ -56,8 +56,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             let flags = event.modifierFlags.intersection([.command, .control, .option, .shift])
             switch event.keyCode {
             case 53 where flags.isEmpty: // Esc
-                if self.model.settings { self.model.settings = false; self.model.focusRequest += 1 }
+                if self.model.confirmCloseAll { self.model.cancelCloseAll() }
+                else if self.model.settings { self.model.settings = false; self.model.focusRequest += 1 }
                 else if !self.model.query.isEmpty { self.model.query = "" }
+                else if self.model.batchMode { self.model.exitBatchMode() }
                 else { self.closePanel() }
             default:
                 guard self.model.trusted, !self.model.settings else { return event }
@@ -68,7 +70,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 case 36, 76: // Return, Enter
                     guard flags.isEmpty || flags == .command else { return event }
                     if let w = self.model.filtered.first(where: { $0.id == self.model.selected }) {
-                        self.model.focus(w, collapse: flags == .command)
+                        if self.model.batchMode {
+                            self.model.toggleBatch(w.id)
+                        } else {
+                            self.model.focus(w, collapse: flags == .command)
+                        }
                     }
                 default: return event
                 }
@@ -85,6 +91,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func closePanel() {
         guard panel.isVisible else { return }
+        model.cancelCloseAll()
+        model.exitBatchMode()
         lastCloseTime = ProcessInfo.processInfo.systemUptime
         panel.orderOut(nil)
         if let monitor = globalClickMonitor {
@@ -134,7 +142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             closePanel()
             let menu = NSMenu()
             menu.autoenablesItems = false
-            for (title, command) in [("一键专注", "focus"), ("错落排齐", "cascade"), ("撤销上次整理", "undo")] {
+            for (title, command) in [("一键专注", "focus"), ("错落排齐", "cascade"), ("关闭所有窗口", "closeAll"), ("撤销上次整理", "undo")] {
                 let entry = menu.addItem(withTitle: title, action: #selector(runCommand(_:)), keyEquivalent: "")
                 entry.target = self
                 entry.representedObject = command
@@ -158,6 +166,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func runCommand(_ sender: NSMenuItem) {
         guard AXIsProcessTrusted(), let command = sender.representedObject as? String else { show(settings: false); return }
+        if command == "closeAll" && UserDefaults.standard.bool(forKey: "confirmCloseAll") {
+            let count = ManagedWindow.scan(order: ManagedWindow.stacking()).count
+            guard count > 0 else {
+                item.button?.toolTip = "当前没有可关闭的窗口"
+                return
+            }
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "关闭全部 \(count) 个窗口？"
+            alert.informativeText = "将向所有应用的标准窗口发送关闭指令；有未保存内容的应用会按系统默认弹出保存提示。"
+            alert.addButton(withTitle: "全部关闭")
+            alert.addButton(withTitle: "取消")
+            NSApp.activate(ignoringOtherApps: true)
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
         if command == "focus", menuFront == nil {
             let rows = ManagedWindow.scan(order: menuOrder)
             menuFront = (rows.first { $0.visible && $0.id.pid == menuPID } ?? rows.first { $0.visible })?.id

@@ -52,6 +52,10 @@ struct ManagedWindow: Identifiable {
     var visible: Bool { zOrder != Int.max && !isMinimized && !isAppHidden }
 
     var frame: CGRect? {
+        Self.readFrame(element)
+    }
+
+    static func readFrame(_ element: AXUIElement) -> CGRect? {
         guard let pos = attribute(element, kAXPositionAttribute),
               let dim = attribute(element, kAXSizeAttribute),
               CFGetTypeID(pos) == AXValueGetTypeID(), CFGetTypeID(dim) == AXValueGetTypeID() else { return nil }
@@ -90,10 +94,37 @@ struct ManagedWindow: Identifiable {
         return activated || raised
     }
 
-    func close() -> Bool {
+    var canQuitApp: Bool {
+        app != .current && app.bundleIdentifier != "com.apple.finder" && !app.isTerminated
+    }
+
+    private func pressCloseButton() -> Bool {
         guard let button = attribute(element, kAXCloseButtonAttribute),
               CFGetTypeID(button) == AXUIElementGetTypeID() else { return false }
-        return AXUIElementPerformAction(button as! AXUIElement, kAXPressAction as CFString) == .success
+        let axButton = button as! AXUIElement
+        if attribute(axButton, kAXEnabledAttribute) as? Bool == false { return false }
+        return AXUIElementPerformAction(axButton, kAXPressAction as CFString) == .success
+    }
+
+    func close() -> Bool {
+        guard !app.isTerminated else { return true }
+        if pressCloseButton() { return true }
+
+        // Many apps disable AXCloseButton while minimized or hidden; briefly restore and retry.
+        let wasHidden = app.isHidden
+        let wasMinimized = attribute(element, kAXMinimizedAttribute) as? Bool == true
+        if wasHidden { _ = app.unhide() }
+        if wasMinimized { _ = minimize(false) }
+        if (wasHidden || wasMinimized), pressCloseButton() { return true }
+
+        // Fallback: some windows expose an AXClose action directly on the window element.
+        var names: CFArray?
+        if AXUIElementCopyActionNames(element, &names) == .success,
+           let list = names as? [String], list.contains("AXClose"),
+           AXUIElementPerformAction(element, "AXClose" as CFString) == .success {
+            return true
+        }
+        return false
     }
 
     static func stacking() -> [CGWindowID: Int] {
@@ -118,12 +149,15 @@ struct ManagedWindow: Identifiable {
                 if windowID(w, &number) != .success { number = 0 }
                 let minimized = attribute(w, kAXMinimizedAttribute) as? Bool == true
                 let rank = order[number] ?? Int.max
-                guard rank != Int.max || minimized || app.isHidden || number == 0 else { continue }
+                let onScreen = rank != Int.max && !minimized && !app.isHidden
+                // Exclude invisible tray-closed windows (off-screen, not minimized, app not hidden).
+                guard onScreen || minimized || app.isHidden else { continue }
+                if !onScreen, let rect = Self.readFrame(w), rect.width < 2 || rect.height < 2 { continue }
                 let title = attribute(w, kAXTitleAttribute) as? String ?? ""
                 result.append(Self(id: WindowKey(pid: pid, number: number, fallback: number == 0 ? w : nil),
                                    element: w, app: app, appName: name, title: title.isEmpty ? name : title,
                                    isMinimized: minimized, isAppHidden: app.isHidden,
-                                   zOrder: minimized || app.isHidden ? Int.max : rank))
+                                   zOrder: onScreen ? rank : Int.max))
             }
         }
         return result.sorted { ($0.zOrder, $0.appName, $0.title, $0.id.number) < ($1.zOrder, $1.appName, $1.title, $1.id.number) }
@@ -193,6 +227,95 @@ final class Organizer {
             return "窗口已处于错落排齐位置"
         }
         return "已移动 \(repairs.count) 个窗口" + (failed > 0 ? "，\(failed) 个未能移动" : "")
+    }
+
+    func collapse(keepingIds keptIds: Set<WindowKey>, windows: [ManagedWindow], hideApps: Bool) -> String {
+        guard !keptIds.isEmpty else { return "请先选择要保留的窗口" }
+        var repairs = [() -> Bool]()
+        var failed = 0
+        if hideApps {
+            let keptPIDs = Set(windows.filter { keptIds.contains($0.id) }.map { $0.app.processIdentifier })
+            let activeApps = Set(windows.filter(\.visible).map { $0.app.processIdentifier })
+            for app in NSWorkspace.shared.runningApplications
+            where !keptPIDs.contains(app.processIdentifier) && app != .current && app.activationPolicy == .regular && !app.isHidden {
+                guard activeApps.contains(app.processIdentifier) else { continue }
+                if app.hide() { repairs.append { app.isTerminated || !app.isHidden || app.unhide() } }
+                else { failed += 1 }
+            }
+        } else {
+            for w in windows where w.visible && !keptIds.contains(w.id) {
+                if attribute(w.element, "AXFullScreen") as? Bool == true { continue }
+                guard settable(w.element, kAXMinimizedAttribute) else { continue }
+                if w.minimize(true) {
+                    repairs.append { w.app.isTerminated || w.minimize(false) || !Self.exists(w) }
+                } else { failed += 1 }
+            }
+        }
+        snapshot.record(repairs)
+        if repairs.isEmpty && failed == 0 {
+            return "其余窗口已收起"
+        }
+        let message = hideApps ? "已保留所选，隐藏 \(repairs.count) 个应用" : "已保留所选，收起 \(repairs.count) 个窗口"
+        return message + (failed > 0 ? "，\(failed) 项未成功" : "")
+    }
+
+    func quitApp(_ app: NSRunningApplication, name: String) -> String {
+        guard app != .current, app.bundleIdentifier != "com.apple.finder" else {
+            return "访达不支持退出"
+        }
+        guard !app.isTerminated else { return "\(name) 已退出" }
+        return app.terminate() ? "正在退出 \(name)" : "无法退出 \(name)"
+    }
+
+    func closeWindows(_ targets: [ManagedWindow], allWindows: [ManagedWindow]? = nil,
+                      quitEmptyApps: Bool = false, keptCount: Int = 0) -> String {
+        guard !targets.isEmpty else {
+            return keptCount > 0 ? "已保留所选，没有其他需要关闭的窗口" : "当前没有可关闭的窗口"
+        }
+
+        let targetIDs = Set(targets.map(\.id))
+        let quitPIDs: Set<pid_t>
+        if quitEmptyApps, let all = allWindows {
+            quitPIDs = BatchSelection.fullyTargetedGroups(
+                all: all.map { ($0.id, $0.id.pid) },
+                targetIDs: targetIDs
+            )
+        } else {
+            quitPIDs = []
+        }
+
+        var closed = 0
+        var quitApps = 0
+        var failed = 0
+        var terminatedPIDs = Set<pid_t>()
+
+        for w in targets {
+            guard !w.app.isTerminated else { continue }
+            if quitPIDs.contains(w.id.pid) && w.canQuitApp {
+                if terminatedPIDs.insert(w.id.pid).inserted {
+                    if w.app.terminate() { quitApps += 1 }
+                    else if w.close() { closed += 1 }
+                    else { failed += 1 }
+                }
+                continue
+            }
+            if w.close() { closed += 1 }
+            else { failed += 1 }
+        }
+
+        if closed == 0 && quitApps == 0 && failed == 0 { return "当前没有可关闭的窗口" }
+        var parts = [String]()
+        if keptCount > 0 { parts.append("已保留 \(keptCount) 个") }
+        if quitApps > 0 { parts.append("已退出 \(quitApps) 个应用") }
+        if closed > 0 { parts.append("已关闭 \(closed) 个窗口") }
+        if failed > 0 {
+            parts.append(quitEmptyApps ? "\(failed) 项未能关闭" : "\(failed) 个不支持窗口关闭（可点应用退出）")
+        }
+        return parts.joined(separator: "，")
+    }
+
+    func closeAll(_ windows: [ManagedWindow], quitEmptyApps: Bool = false) -> String {
+        closeWindows(windows, allWindows: windows, quitEmptyApps: quitEmptyApps)
     }
 
     func undo() -> String {

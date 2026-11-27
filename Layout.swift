@@ -47,7 +47,13 @@ enum Layout {
 
 enum Preferences {
     static func register(in defaults: UserDefaults = .standard) {
-        defaults.register(defaults: ["hideApps": false, "grouped": true, "spacing": 32])
+        defaults.register(defaults: [
+            "hideApps": false,
+            "grouped": true,
+            "spacing": 32,
+            "confirmCloseAll": true,
+            "quitOnCloseAllWindows": false
+        ])
     }
 }
 
@@ -66,5 +72,76 @@ struct UndoSnapshot {
     }
     mutating func restore() {
         repairs = repairs.filter { !$0() }
+    }
+}
+
+enum GroupCheckState: Equatable {
+    case none
+    case partial
+    case all
+}
+
+struct BatchSelection<ID: Hashable> {
+    private(set) var items = Set<ID>()
+
+    var count: Int { items.count }
+    var isEmpty: Bool { items.isEmpty }
+    func contains(_ id: ID) -> Bool { items.contains(id) }
+
+    mutating func toggle(_ id: ID) {
+        if items.remove(id) == nil {
+            items.insert(id)
+        }
+    }
+
+    func groupState(for ids: [ID]) -> GroupCheckState {
+        guard !ids.isEmpty else { return .none }
+        let matched = ids.reduce(0) { $0 + (items.contains($1) ? 1 : 0) }
+        if matched == 0 { return .none }
+        return matched == ids.count ? .all : .partial
+    }
+
+    mutating func toggleGroup(_ ids: [ID]) {
+        guard !ids.isEmpty else { return }
+        if groupState(for: ids) == .all {
+            items.subtract(ids)
+        } else {
+            items.formUnion(ids)
+        }
+    }
+
+    mutating func toggleAll(visible ids: [ID]) {
+        toggleGroup(ids)
+    }
+
+    mutating func invert(visible ids: [ID]) {
+        for id in ids { toggle(id) }
+    }
+
+    mutating func prune(valid ids: Set<ID>) {
+        items.formIntersection(ids)
+    }
+
+    mutating func clear() {
+        items.removeAll()
+    }
+
+    func targetsToClose(all: [ID], keepSelected: Bool) -> [ID] {
+        guard !items.isEmpty else { return [] }
+        return keepSelected ? all.filter { !items.contains($0) } : all.filter { items.contains($0) }
+    }
+
+    static func fullyTargetedGroups<Group: Hashable>(all: [(id: ID, group: Group)], targetIDs: Set<ID>) -> Set<Group> {
+        var total = [Group: Int]()
+        var targeted = [Group: Int]()
+        for entry in all {
+            total[entry.group, default: 0] += 1
+            if targetIDs.contains(entry.id) {
+                targeted[entry.group, default: 0] += 1
+            }
+        }
+        return Set(total.compactMap { group, count in
+            count > 0 && targeted[group] == count ? group : nil
+        })
     }
 }
