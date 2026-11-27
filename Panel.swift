@@ -963,13 +963,12 @@ struct Panel: View {
     private func icon(_ symbol: String, _ name: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .font(.system(size: 12.5))
-                .imageScale(.medium)
+                .font(.system(size: 12.5, weight: .medium))
+                .foregroundStyle(.primary.opacity(0.75))
+                .frame(width: 22, height: 22)
+                .contentShape(Rectangle())
         }
-        .glassButton()
-        .buttonBorderShape(.circle)
-        .controlSize(.mini)
-        .frame(width: 22, height: 22)
+        .buttonStyle(.plain)
         .accessibilityLabel(name)
         .help(name)
     }
